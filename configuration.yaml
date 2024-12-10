@@ -1,0 +1,222 @@
+---
+- name: Install and configure Apache Tomcat
+  hosts: 10.0.3.58
+  become: true
+  vars:
+    db_endpoint: "terraform-20241113063842053300000002.cgkf5qiqs0zz.us-east-2.rds.amazonaws.com"
+    db_port: 3306
+    db_name: "shopping-cart"
+    db_username: "admin"
+    db_password: "Saraswathy123"
+    app_war_name: "shopping-cart-0.0.1-SNAPSHOT.war"
+
+  tasks:
+    - name: Update APT package index
+      apt:
+        update_cache: yes
+
+    - name: Install OpenJDK 11
+      apt:
+        name: openjdk-11-jdk
+        state: present
+
+    - name: Verify Java installation
+      command: java -version
+      register: java_version
+      ignore_errors: yes
+
+    - name: Create Tomcat user without login privileges
+      shell: useradd -m -U -d /opt/tomcat -s /bin/false tomcat
+      ignore_errors: yes
+
+    - name: Download Apache Tomcat 8.5.0
+      get_url:
+        url: https://archive.apache.org/dist/tomcat/tomcat-8/v8.5.0/bin/apache-tomcat-8.5.0.tar.gz
+        dest: /tmp/apache-tomcat-8.5.0.tar.gz
+
+    - name: Extract Tomcat archive
+      unarchive:
+        src: /tmp/apache-tomcat-8.5.0.tar.gz
+        dest: /opt/tomcat
+        remote_src: yes
+        extra_opts: [--strip-components=1]
+
+    - name: Set ownership and permissions for Tomcat directory
+      file:
+        path: /opt/tomcat
+        owner: tomcat
+        group: tomcat
+        recurse: yes
+
+    - name: Set executable permissions for Tomcat scripts
+      file:
+        path: /opt/tomcat/bin
+        mode: '0755'
+        recurse: yes
+
+    - name: Create Tomcat systemd service file
+      copy:
+        dest: /etc/systemd/system/tomcat.service
+        content: |
+          [Unit]
+          Description=Apache Tomcat
+          After=network.target
+
+          [Service]
+          Type=forking
+          User=tomcat
+          Group=tomcat
+          Environment=JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+          Environment=CATALINA_PID=/opt/tomcat/tomcat.pid
+          Environment=CATALINA_HOME=/opt/tomcat
+          Environment=CATALINA_BASE=/opt/tomcat
+          Environment="CATALINA_OPTS=-Xms512M -Xmx1024M -server -XX:+UseParallelGC"
+          ExecStart=/opt/tomcat/bin/startup.sh
+          ExecStop=/opt/tomcat/bin/shutdown.sh
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd manager configuration
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start Tomcat service
+      systemd:
+        name: tomcat
+        enabled: yes
+        state: started
+
+    - name: Insert roles and users in tomcat-users.xml
+      replace:
+        path: /opt/tomcat/conf/tomcat-users.xml
+        regexp: '(<\/tomcat-users>)'
+        replace: |
+          <role rolename="admin-gui"/>
+          <role rolename="manager-gui"/>
+          <user username="admin" password="securepassword" roles="admin-gui,manager-gui"/>
+          \1
+
+    - name: Comment out existing Valve block in host-manager context.xml
+      replace:
+        path: /opt/tomcat/webapps/host-manager/META-INF/context.xml
+        regexp: '(<Valve className="org\.apache\.catalina\.valves\.RemoteAddrValve"[^>]*/>)'
+        replace: '<!--\1-->'
+        backup: yes
+
+    - name: Restart Tomcat
+      systemd:
+        name: tomcat
+        state: restarted
+
+    - name: Install Maven
+      package:
+        name: maven
+        state: present
+
+    - name: Clone the application repository
+      git:
+        repo: https://github.com/Abhilash-1201/Shopping-Cart-3tier-App.git
+        dest: /home/ubuntu/Shopping-Cart-3tier-App
+      ignore_errors: yes
+
+    - name: Update connectionString in DBUtil.java
+      replace:
+        path: /home/ubuntu/Shopping-Cart-3tier-App/src/com/shashi/utility/DBUtil.java
+        regexp: '^(\s*)String connectionString = "jdbc:mysql://[^:]*:\d+/[^"]*";'
+        replace: '\1String connectionString = "jdbc:mysql://{{ db_endpoint }}:{{ db_port }}/{{ db_name }}";'
+        backup: yes
+
+    - name: Update username in DBUtil.java
+      replace:
+        path: /home/ubuntu/Shopping-Cart-3tier-App/src/com/shashi/utility/DBUtil.java
+        regexp: '^(\s*)String username = ".*";'
+        replace: '\1String username = "{{ db_username }}";'
+        backup: yes
+
+    - name: Update password in DBUtil.java
+      replace:
+        path: /home/ubuntu/Shopping-Cart-3tier-App/src/com/shashi/utility/DBUtil.java
+        regexp: '^(\s*)String password = ".*";'
+        replace: '\1String password = "{{ db_password }}";'
+        backup: yes
+
+    - name: Build the application with Maven
+      command: mvn clean package
+      args:
+        chdir: /home/ubuntu/Shopping-Cart-3tier-App
+
+    - name: Copy application WAR file to Tomcat webapps
+      copy:
+        src: /home/ubuntu/Shopping-Cart-3tier-App/target/{{ app_war_name }}
+        dest: /opt/tomcat/webapps/
+        remote_src: yes
+
+    - name: Restart Tomcat after WAR deployment
+      systemd:
+        name: tomcat
+        state: restarted
+
+    - name: Install Datadog Agent
+      shell: |
+        DD_API_KEY=60121581c69cbd4cd59ffada1e0c04c1 \
+        DD_SITE="datadoghq.com" \
+        bash -c "$(curl -L https://install.datadoghq.com/scripts/install_script_agent7.sh)"
+      become: yes
+
+    - name: Install Docker
+      apt:
+        name: docker.io
+        state: present
+        update_cache: yes
+
+    - name: Start and enable Docker service
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Create Dockerfile with versioned tag
+      copy:
+        dest: /home/ubuntu/Shopping-Cart-3tier-App/target/Dockerfile
+        content: |
+          FROM tomcat:8.5.14
+          COPY {{ app_war_name }} /usr/local/tomcat/webapps/
+          EXPOSE 8080
+          CMD ["catalina.sh", "run"]
+
+    - name: Build Docker image with versioned tag
+      shell: docker build -t shopping-carts:v{{ ansible_date_time.epoch }} .
+      args:
+        chdir: /home/ubuntu/Shopping-Cart-3tier-App/target
+      ignore_errors: yes
+
+    - name: Docker login to Docker Hub
+      docker_login:
+        username: saradevops
+        password: Sara@1234
+
+    - name: Stop existing Docker container
+      shell: docker stop shopping-carts-container
+      ignore_errors: yes
+
+    - name: Remove existing Docker container
+      shell: docker rm shopping-carts-container
+      ignore_errors: yes
+
+    - name: Run Docker container with versioned tag
+      shell: docker run -d -p 8800:8080 --name shopping-carts-container shopping-carts:v{{ ansible_date_time.epoch }}
+      register: docker_run_output
+      ignore_errors: yes
+
+    - name: Debug Docker run output
+      debug:
+        var: docker_run_output.stdout_lines
+        verbosity: 2
+
+    - name: Tag Docker image for Docker Hub
+      shell: docker tag shopping-carts:v{{ ansible_date_time.epoch }} saradevops/shopping-carts:v{{ ansible_date_time.epoch }}
+
+    - name: Push Docker image to Docker Hub
+      shell: docker push saradevops/shopping-carts:v{{ ansible_date_time.epoch }}
